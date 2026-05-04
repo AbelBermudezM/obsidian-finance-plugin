@@ -112,20 +112,41 @@ export class BalanceSheetController {
 	 * @param {'convert' | 'cost' | 'units'} [valuationMethod='convert'] - The valuation method.
 	 * @returns {AccountItem[]} The list of root account items.
 	 */
-	private buildAccountHierarchy(accounts: [string, string][], accountType: string, valuationMethod: 'convert' | 'cost' | 'units' = 'convert'): AccountItem[] {
+	private buildAccountHierarchy(
+		accounts: [string, string][],
+		accountType: string,
+		valuationMethod: 'convert' | 'cost' | 'units' = 'convert',
+		displayCurrency?: string,
+	): AccountItem[] {
 		const reportingCurrency = this.plugin.settings.operatingCurrency;
+		const target = (displayCurrency || reportingCurrency || '').toUpperCase();
 		const accountMap = new Map<string, AccountItem>();
 		const rootAccounts: AccountItem[] = [];
 
-		// Group accounts by their hierarchy levels
 		for (const [fullAccount, rawAmount] of accounts) {
 			let convertedAmount: string;
 			let otherCurrencies: string;
-			
-			// For all valuation methods, separate operating currency from other currencies
-			convertedAmount = extractConvertedAmount(rawAmount, reportingCurrency);
-			otherCurrencies = extractNonReportingCurrencies(rawAmount, reportingCurrency);
-			
+
+			if (valuationMethod === 'convert') {
+				// Single-currency rows after `convert(...)` — pull the amount
+				// out of the inventory string.
+				convertedAmount = extractConvertedAmount(rawAmount, target);
+				otherCurrencies = extractNonReportingCurrencies(rawAmount, target);
+			} else {
+				// `units(sum(position))` / `cost(sum(position))` returns the
+				// raw inventory in the row's own currency. Take the first
+				// currency-amount pair as the primary number; the rest go
+				// into the "Other Currencies" cell.
+				const firstMatch = rawAmount.match(/(-?[\d,]+\.?\d*)\s*([A-Z][A-Z0-9'._-]*)/);
+				if (firstMatch) {
+					convertedAmount = `${firstMatch[1]} ${firstMatch[2]}`;
+				} else {
+					convertedAmount = `0 ${target}`;
+				}
+				const parts = rawAmount.split(',').map(s => s.trim()).filter(Boolean);
+				otherCurrencies = parts.slice(1).join('\n');
+			}
+
 			const amountNumber = parseFloat(convertedAmount.split(' ')[0].replace(/,/g, '')) || 0;
 
 			const parts = fullAccount.split(':');
@@ -211,9 +232,10 @@ export class BalanceSheetController {
 	/**
 	 * Sets the valuation method (market value, at cost, or units) and reloads data.
 	 * @param {'convert' | 'cost' | 'units'} method - The valuation method.
+	 * @param {string} [convertTarget] - Optional currency to convert into (only used with 'convert').
 	 */
-	async setValuationMethod(method: 'convert' | 'cost' | 'units') {
-		await this.loadData(method);
+	async setValuationMethod(method: 'convert' | 'cost' | 'units', convertTarget?: string) {
+		await this.loadData(method, convertTarget);
 	}
 
 	/**
@@ -377,12 +399,18 @@ export class BalanceSheetController {
 	 * Main data fetching method.
 	 * Runs Beancount queries based on the valuation method and updates state.
 	 * @param {'convert' | 'cost' | 'units'} [valuationMethod='convert'] - The valuation method to use.
+	 * @param {string} [convertTarget] - When valuationMethod is 'convert', the currency to convert into.
+	 *                                    Defaults to the operating currency if omitted.
 	 */
-	async loadData(valuationMethod: 'convert' | 'cost' | 'units' = 'convert') {
+	async loadData(
+		valuationMethod: 'convert' | 'cost' | 'units' = 'convert',
+		convertTarget?: string,
+	) {
 		this.state.update(s => ({ ...s, isLoading: true, error: null }));
 		const reportingCurrency = this.plugin.settings.operatingCurrency;
-		
-		if (valuationMethod === 'convert' && !reportingCurrency) {
+		const target = (convertTarget?.trim() || reportingCurrency || '').toUpperCase();
+
+		if (valuationMethod === 'convert' && !target) {
 			this.state.update(s => ({ ...s, isLoading: false, error: "Operating currency not set." }));
 			return;
 		}
@@ -391,7 +419,7 @@ export class BalanceSheetController {
 			let query: string;
 			switch (valuationMethod) {
 				case 'convert':
-					query = queries.getBalanceSheetQuery(reportingCurrency);
+					query = queries.getBalanceSheetQuery(target);
 					break;
 				case 'cost':
 					query = queries.getBalanceSheetQueryByCost();
@@ -433,20 +461,28 @@ export class BalanceSheetController {
 				}
 			}
 
+			// Determine the column-header currency. In `convert` mode the
+			// rows are all expressed in the chosen target. In `units` /
+			// `cost` mode the rows keep their native currencies — the
+			// header surfaces "Native" instead of a single code.
+			const headerCurrency = valuationMethod === 'convert'
+				? target
+				: (valuationMethod === 'cost' ? 'Cost' : 'Native');
+
 			// Build hierarchical structures
-			const assetsHierarchy = this.buildAccountHierarchy(tempAssets, 'Assets', valuationMethod);
-			const liabilitiesHierarchy = this.buildAccountHierarchy(tempLiab, 'Liabilities', valuationMethod);
-			const equityHierarchy = this.buildAccountHierarchy(tempEquity, 'Equity', valuationMethod);
+			const assetsHierarchy = this.buildAccountHierarchy(tempAssets, 'Assets', valuationMethod, target);
+			const liabilitiesHierarchy = this.buildAccountHierarchy(tempLiab, 'Liabilities', valuationMethod, target);
+			const equityHierarchy = this.buildAccountHierarchy(tempEquity, 'Equity', valuationMethod, target);
 
 			// Calculate totals - always use reporting currency
-			const totalAssets = this.calculateCategoryTotals(assetsHierarchy, reportingCurrency);
-			const totalLiabilities = this.calculateCategoryTotals(liabilitiesHierarchy, reportingCurrency);
-			const totalEquity = this.calculateCategoryTotals(equityHierarchy, reportingCurrency);
+			const totalAssets = this.calculateCategoryTotals(assetsHierarchy, headerCurrency);
+			const totalLiabilities = this.calculateCategoryTotals(liabilitiesHierarchy, headerCurrency);
+			const totalEquity = this.calculateCategoryTotals(equityHierarchy, headerCurrency);
 
 			// Create warning message
 			let unconvertedWarning = null;
 			if (hasUnconvertedCommodities) {
-				unconvertedWarning = `Multi-currency accounts detected. ${reportingCurrency} amounts are shown in the first column, other currencies are displayed separately in the second column. Only ${reportingCurrency} amounts are included in totals.`;
+				unconvertedWarning = `Multi-currency accounts detected. ${target} amounts are shown in the first column, other currencies are displayed separately in the second column. Only ${target} amounts are included in totals.`;
 			}
 
 			const currentState = get(this.state);
@@ -461,7 +497,7 @@ export class BalanceSheetController {
 				totalAssets,
 				totalLiabilities,
 				totalEquity,
-				currency: reportingCurrency,
+				currency: headerCurrency,
 				hasUnconvertedCommodities,
 				unconvertedWarning,
 				valuationMethod,
